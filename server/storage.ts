@@ -36,7 +36,7 @@ import {
   type PatientWithCompliance,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and, desc, gte, lte, sql, avg } from "drizzle-orm";
+import { eq, and, desc, gte, lte, sql, avg, getTableColumns } from "drizzle-orm";
 
 export interface IStorage {
   // User operations (IMPORTANT: mandatory for Replit Auth)
@@ -88,6 +88,8 @@ export interface IStorage {
   updateMedicineSchedule(id: string, updates: Partial<InsertMedicineSchedule>): Promise<MedicineSchedule | undefined>;
   markMedicineAsTaken(scheduleId: string): Promise<MedicineSchedule | undefined>;
   markMedicineAsSkipped(scheduleId: string, reason?: string): Promise<MedicineSchedule | undefined>;
+  markMedicineAsMissed(scheduleId: string): Promise<MedicineSchedule | undefined>;
+  addMedicineToPrescription(medicine: InsertMedicine): Promise<Medicine>;
   
   // Reminder operations
   createReminderSettings(settings: InsertReminderSettings): Promise<ReminderSettings>;
@@ -378,6 +380,17 @@ export class DatabaseStorage implements IStorage {
     });
   }
 
+  async markMedicineAsMissed(scheduleId: string): Promise<MedicineSchedule | undefined> {
+    return await this.updateMedicineSchedule(scheduleId, {
+      status: "overdue", // Using "overdue" to match existing enum
+    });
+  }
+
+  // Alias for route compatibility
+  async addMedicineToPrescription(medicine: InsertMedicine): Promise<Medicine> {
+    return await this.createMedicine(medicine);
+  }
+
   // Compliance tracking
   async getComplianceRate(patientId: string, days: number = 7): Promise<number> {
     const startDate = new Date();
@@ -464,13 +477,58 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getPrescription(id: string): Promise<PrescriptionWithDetails | undefined> {
-    // Implementation placeholder - would join with doctors, patients, hospitals, medicines
-    const [prescription] = await db.select().from(prescriptions).where(eq(prescriptions.id, id));
-    return prescription as any; // TODO: implement proper join
+    const result = await db
+      .select({
+        ...getTableColumns(prescriptions),
+        doctorName: sql<string>`${doctors.firstName} || ' ' || ${doctors.lastName}`,
+        patientName: sql<string>`${patients.firstName} || ' ' || ${patients.lastName}`,
+        hospitalName: hospitals.name,
+        medicines: sql<Medicine[]>`COALESCE(json_agg(DISTINCT jsonb_build_object(
+          'id', ${medicines.id},
+          'name', ${medicines.name},
+          'dosage', ${medicines.dosage},
+          'frequency', ${medicines.frequency},
+          'duration', ${medicines.duration},
+          'instructions', ${medicines.instructions}
+        )) FILTER (WHERE ${medicines.id} IS NOT NULL), '[]'::json)`,
+      })
+      .from(prescriptions)
+      .leftJoin(doctors, eq(prescriptions.doctorId, doctors.id))
+      .leftJoin(patients, eq(prescriptions.patientId, patients.id))
+      .leftJoin(hospitals, eq(prescriptions.hospitalId, hospitals.id))
+      .leftJoin(medicines, eq(medicines.prescriptionId, prescriptions.id))
+      .where(eq(prescriptions.id, id))
+      .groupBy(prescriptions.id, doctors.id, patients.id, hospitals.id)
+      .limit(1);
+
+    return result.length > 0 ? result[0] : undefined;
   }
 
   async getPrescriptionsByPatient(patientId: string): Promise<PrescriptionWithDetails[]> {
-    return []; // TODO: implement
+    const result = await db
+      .select({
+        ...getTableColumns(prescriptions),
+        doctorName: sql<string>`${doctors.firstName} || ' ' || ${doctors.lastName}`,
+        patientName: sql<string>`${patients.firstName} || ' ' || ${patients.lastName}`,
+        hospitalName: hospitals.name,
+        medicines: sql<Medicine[]>`COALESCE(json_agg(DISTINCT jsonb_build_object(
+          'id', ${medicines.id},
+          'name', ${medicines.name},
+          'dosage', ${medicines.dosage},
+          'frequency', ${medicines.frequency},
+          'duration', ${medicines.duration},
+          'instructions', ${medicines.instructions}
+        )) FILTER (WHERE ${medicines.id} IS NOT NULL), '[]'::json)`,
+      })
+      .from(prescriptions)
+      .leftJoin(doctors, eq(prescriptions.doctorId, doctors.id))
+      .leftJoin(patients, eq(prescriptions.patientId, patients.id))
+      .leftJoin(hospitals, eq(prescriptions.hospitalId, hospitals.id))
+      .leftJoin(medicines, eq(medicines.prescriptionId, prescriptions.id))
+      .where(eq(prescriptions.patientId, patientId))
+      .groupBy(prescriptions.id, doctors.id, patients.id, hospitals.id);
+
+    return result;
   }
 
   async getPrescriptionsByDoctor(doctorId: string): Promise<PrescriptionWithDetails[]> {

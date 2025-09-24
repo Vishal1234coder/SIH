@@ -3,7 +3,8 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { setupAuth, isAuthenticated } from "./replitAuth";
-import { requireRole, requireHospitalScope, requireOwnPatientData } from "./middleware/auth";
+import { requireRole, requireHospitalScope, requireOwnPatientData, requirePrescriptionAccess, requireDoctorOfPatient } from "./middleware/auth";
+import { insertPrescriptionSchema, insertMedicineSchema, insertMedicineScheduleSchema } from "../shared/schema";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Auth middleware
@@ -81,6 +82,122 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Prescription Management APIs
+
+  // Create prescription (doctors only)
+  app.post("/api/prescriptions", isAuthenticated, requireRole("doctor"), async (req: any, res) => {
+    try {
+      const doctor = await storage.getDoctorByUserId(req.user.claims.sub);
+      if (!doctor) {
+        return res.status(404).json({ message: "Doctor profile not found" });
+      }
+
+      // Validate request body
+      const validatedData = insertPrescriptionSchema.parse({
+        ...req.body,
+        doctorId: doctor.id,
+        hospitalId: doctor.hospitalId,
+      });
+
+      // Verify patient exists and belongs to the same hospital
+      const patient = await storage.getPatient(validatedData.patientId);
+      if (!patient || patient.hospitalId !== doctor.hospitalId) {
+        return res.status(403).json({ message: "Patient not found in your hospital" });
+      }
+
+      const prescription = await storage.createPrescription(validatedData);
+      res.status(201).json(prescription);
+    } catch (error) {
+      console.error("Error creating prescription:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ message: "Invalid prescription data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create prescription" });
+    }
+  });
+
+  // Get prescriptions for a patient
+  app.get("/api/patients/:patientId/prescriptions", isAuthenticated, requireDoctorOfPatient, async (req: any, res) => {
+    try {
+      const { patientId } = req.params;
+      const prescriptions = await storage.getPrescriptionsByPatient(patientId);
+      res.json(prescriptions);
+    } catch (error) {
+      console.error("Error fetching prescriptions:", error);
+      res.status(500).json({ message: "Failed to fetch prescriptions" });
+    }
+  });
+
+  // Get patient's own prescriptions
+  app.get("/api/patient/prescriptions", isAuthenticated, requireRole("patient"), requireOwnPatientData, async (req: any, res) => {
+    try {
+      const patient = req.currentPatient;
+      const prescriptions = await storage.getPrescriptionsByPatient(patient.id);
+      res.json(prescriptions);
+    } catch (error) {
+      console.error("Error fetching patient prescriptions:", error);
+      res.status(500).json({ message: "Failed to fetch prescriptions" });
+    }
+  });
+
+  // Add medicine to prescription
+  app.post("/api/prescriptions/:prescriptionId/medicines", isAuthenticated, requireRole("doctor"), requirePrescriptionAccess, async (req: any, res) => {
+    try {
+      const { prescriptionId } = req.params;
+      
+      // Validate request body
+      const validatedData = insertMedicineSchema.parse({
+        ...req.body,
+        prescriptionId,
+      });
+
+      const medicine = await storage.addMedicineToPrescription(validatedData);
+      res.status(201).json(medicine);
+    } catch (error) {
+      console.error("Error adding medicine:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ message: "Invalid medicine data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to add medicine" });
+    }
+  });
+
+  // Create medicine schedule
+  app.post("/api/medicines/:medicineId/schedule", isAuthenticated, requireRole("doctor"), async (req: any, res) => {
+    try {
+      const { medicineId } = req.params;
+      
+      // Verify doctor has access to this medicine's prescription
+      const medicine = await storage.getMedicine(medicineId);
+      if (!medicine) {
+        return res.status(404).json({ message: "Medicine not found" });
+      }
+
+      const doctor = await storage.getDoctorByUserId(req.user.claims.sub);
+      const prescription = await storage.getPrescription(medicine.prescriptionId);
+      
+      if (!doctor || !prescription || prescription.doctorId !== doctor.id) {
+        return res.status(403).json({ message: "Forbidden: Not your prescription" });
+      }
+
+      // Validate request body
+      const validatedData = insertMedicineScheduleSchema.parse({
+        ...req.body,
+        medicineId,
+        patientId: prescription.patientId,
+      });
+
+      const schedule = await storage.createMedicineSchedule(validatedData);
+      res.status(201).json(schedule);
+    } catch (error) {
+      console.error("Error creating schedule:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ message: "Invalid schedule data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create schedule" });
+    }
+  });
+
   // Mark medicine as taken (patient only)
   app.post("/api/medicine-schedule/:scheduleId/taken", isAuthenticated, requireRole("patient"), async (req: any, res) => {
     try {
@@ -102,6 +219,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Error marking medicine as taken:", error);
       res.status(500).json({ message: "Failed to mark medicine as taken" });
+    }
+  });
+
+  // Mark medicine as missed
+  app.post("/api/medicine-schedule/:scheduleId/missed", isAuthenticated, requireRole("patient"), async (req: any, res) => {
+    try {
+      const { scheduleId } = req.params;
+      
+      // Verify the schedule belongs to the current patient
+      const schedule = await storage.getMedicineSchedule(scheduleId);
+      if (!schedule) {
+        return res.status(404).json({ message: "Medicine schedule not found" });
+      }
+
+      const patient = await storage.getPatientByUserId(req.user.claims.sub);
+      if (!patient || schedule.patientId !== patient.id) {
+        return res.status(403).json({ message: "Forbidden: Not your medicine" });
+      }
+
+      const updatedSchedule = await storage.markMedicineAsMissed(scheduleId);
+      res.json(updatedSchedule);
+    } catch (error) {
+      console.error("Error marking medicine as missed:", error);
+      res.status(500).json({ message: "Failed to mark medicine as missed" });
     }
   });
 

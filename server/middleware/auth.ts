@@ -53,10 +53,10 @@ export const requireDoctorOfPatient: RequestHandler = async (req: any, res, next
       return res.status(404).json({ message: "Patient not found" });
     }
 
-    // Check if this doctor is the primary doctor or in the same hospital
-    if (patient.primaryDoctorId !== doctor.id && patient.hospitalId !== doctor.hospitalId) {
+    // Check if this doctor is the primary doctor (restrict to primary doctor only for PHI privacy)
+    if (patient.primaryDoctorId !== doctor.id) {
       return res.status(403).json({ 
-        message: "Forbidden: Not authorized to access this patient" 
+        message: "Forbidden: Only the primary doctor can access this patient" 
       });
     }
 
