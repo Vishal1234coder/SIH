@@ -104,6 +104,15 @@ export interface IStorage {
   getComplianceRate(patientId: string, days?: number): Promise<number>;
   updateDailyCompliance(patientId: string, prescriptionId: string, date: Date): Promise<void>;
   getComplianceTracking(patientId: string, startDate: Date, endDate: Date): Promise<ComplianceTracking[]>;
+  
+  // Enhanced compliance analytics
+  getWeeklyComplianceStats(patientId: string, weeks?: number): Promise<any[]>;
+  getDailyComplianceStats(patientId: string, days?: number): Promise<any[]>;
+  getMedicineComplianceBreakdown(patientId: string): Promise<any[]>;
+  getComplianceStreak(patientId: string): Promise<number>;
+  getPatientComplianceOverview(doctorId: string): Promise<any[]>;
+  getComplianceAlerts(patientId: string): Promise<any[]>;
+  getDoctorComplianceAlerts(doctorId: string): Promise<any[]>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -367,23 +376,53 @@ export class DatabaseStorage implements IStorage {
   }
 
   async markMedicineAsTaken(scheduleId: string): Promise<MedicineSchedule | undefined> {
-    return await this.updateMedicineSchedule(scheduleId, {
+    const updatedSchedule = await this.updateMedicineSchedule(scheduleId, {
       status: "taken",
       takenAt: new Date(),
     });
+    
+    // Auto-update compliance tracking
+    if (updatedSchedule) {
+      const medicine = await this.getMedicine(updatedSchedule.medicineId);
+      if (medicine) {
+        await this.updateDailyCompliance(updatedSchedule.patientId, medicine.prescriptionId, new Date());
+      }
+    }
+    
+    return updatedSchedule;
   }
 
   async markMedicineAsSkipped(scheduleId: string, reason?: string): Promise<MedicineSchedule | undefined> {
-    return await this.updateMedicineSchedule(scheduleId, {
+    const updatedSchedule = await this.updateMedicineSchedule(scheduleId, {
       status: "skipped",
       skippedReason: reason,
     });
+    
+    // Auto-update compliance tracking
+    if (updatedSchedule) {
+      const medicine = await this.getMedicine(updatedSchedule.medicineId);
+      if (medicine) {
+        await this.updateDailyCompliance(updatedSchedule.patientId, medicine.prescriptionId, new Date());
+      }
+    }
+    
+    return updatedSchedule;
   }
 
   async markMedicineAsMissed(scheduleId: string): Promise<MedicineSchedule | undefined> {
-    return await this.updateMedicineSchedule(scheduleId, {
+    const updatedSchedule = await this.updateMedicineSchedule(scheduleId, {
       status: "overdue", // Using "overdue" to match existing enum
     });
+    
+    // Auto-update compliance tracking
+    if (updatedSchedule) {
+      const medicine = await this.getMedicine(updatedSchedule.medicineId);
+      if (medicine) {
+        await this.updateDailyCompliance(updatedSchedule.patientId, medicine.prescriptionId, new Date());
+      }
+    }
+    
+    return updatedSchedule;
   }
 
   // Alias for route compatibility
@@ -601,6 +640,201 @@ export class DatabaseStorage implements IStorage {
       .where(eq(chatHistory.userId, userId))
       .orderBy(desc(chatHistory.createdAt))
       .limit(limit);
+  }
+
+  // Enhanced compliance analytics implementations
+  async getWeeklyComplianceStats(patientId: string, weeks: number = 4): Promise<any[]> {
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - (weeks * 7));
+
+    const result = await db
+      .select({
+        week: sql<string>`DATE_TRUNC('week', ${complianceTracking.date})`,
+        avgCompliance: sql<number>`AVG(CAST(${complianceTracking.compliancePercentage} AS numeric))`,
+        totalDoses: sql<number>`SUM(${complianceTracking.totalDoses})`,
+        takenDoses: sql<number>`SUM(${complianceTracking.takenDoses})`,
+      })
+      .from(complianceTracking)
+      .where(and(
+        eq(complianceTracking.patientId, patientId),
+        gte(complianceTracking.date, startDate)
+      ))
+      .groupBy(sql`DATE_TRUNC('week', ${complianceTracking.date})`)
+      .orderBy(sql`DATE_TRUNC('week', ${complianceTracking.date})`);
+
+    return result;
+  }
+
+  async getDailyComplianceStats(patientId: string, days: number = 7): Promise<any[]> {
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    const result = await db
+      .select({
+        date: complianceTracking.date,
+        compliancePercentage: sql<number>`CAST(${complianceTracking.compliancePercentage} AS numeric)`,
+        totalDoses: complianceTracking.totalDoses,
+        takenDoses: complianceTracking.takenDoses,
+        skippedDoses: complianceTracking.skippedDoses,
+      })
+      .from(complianceTracking)
+      .where(and(
+        eq(complianceTracking.patientId, patientId),
+        gte(complianceTracking.date, startDate)
+      ))
+      .orderBy(complianceTracking.date);
+
+    return result;
+  }
+
+  async getMedicineComplianceBreakdown(patientId: string): Promise<any[]> {
+    const result = await db
+      .select({
+        medicineId: medicines.id,
+        medicineName: medicines.name,
+        dosage: medicines.dosage,
+        frequency: medicines.frequency,
+        totalScheduled: sql<number>`COUNT(${medicineSchedule.id})`,
+        taken: sql<number>`COUNT(CASE WHEN ${medicineSchedule.status} = 'taken' THEN 1 END)`,
+        missed: sql<number>`COUNT(CASE WHEN ${medicineSchedule.status} = 'overdue' THEN 1 END)`,
+        skipped: sql<number>`COUNT(CASE WHEN ${medicineSchedule.status} = 'skipped' THEN 1 END)`,
+        complianceRate: sql<number>`ROUND((COUNT(CASE WHEN ${medicineSchedule.status} = 'taken' THEN 1 END) * 100.0 / NULLIF(COUNT(${medicineSchedule.id}), 0)), 2)`,
+      })
+      .from(medicines)
+      .leftJoin(medicineSchedule, eq(medicines.id, medicineSchedule.medicineId))
+      .leftJoin(prescriptions, eq(medicines.prescriptionId, prescriptions.id))
+      .where(eq(prescriptions.patientId, patientId))
+      .groupBy(medicines.id, medicines.name, medicines.dosage, medicines.frequency);
+
+    return result;
+  }
+
+  async getComplianceStreak(patientId: string): Promise<number> {
+    const result = await db
+      .select({
+        date: complianceTracking.date,
+        compliancePercentage: sql<number>`CAST(${complianceTracking.compliancePercentage} AS numeric)`,
+      })
+      .from(complianceTracking)
+      .where(eq(complianceTracking.patientId, patientId))
+      .orderBy(desc(complianceTracking.date))
+      .limit(30); // Look at last 30 days
+
+    let streak = 0;
+    for (const day of result) {
+      if (day.compliancePercentage >= 80) { // 80% compliance considered good
+        streak++;
+      } else {
+        break;
+      }
+    }
+
+    return streak;
+  }
+
+  async getPatientComplianceOverview(doctorId: string): Promise<any[]> {
+    const result = await db
+      .select({
+        patientId: patients.id,
+        patientName: sql<string>`${patients.firstName} || ' ' || ${patients.lastName}`,
+        patientEmail: users.email,
+        currentCompliance: sql<number>`COALESCE(AVG(CAST(${complianceTracking.compliancePercentage} AS numeric)), 0)`,
+        totalMedicines: sql<number>`COUNT(DISTINCT ${medicines.id})`,
+        overdueMedicines: sql<number>`COUNT(CASE WHEN ${medicineSchedule.status} = 'overdue' AND ${medicineSchedule.scheduledAt} <= NOW() THEN 1 END)`,
+        lastActivity: sql<Date>`MAX(${medicineSchedule.updatedAt})`,
+      })
+      .from(patients)
+      .leftJoin(users, eq(patients.userId, users.id))
+      .leftJoin(prescriptions, eq(prescriptions.patientId, patients.id))
+      .leftJoin(medicines, eq(medicines.prescriptionId, prescriptions.id))
+      .leftJoin(medicineSchedule, eq(medicineSchedule.medicineId, medicines.id))
+      .leftJoin(complianceTracking, and(
+        eq(complianceTracking.patientId, patients.id),
+        gte(complianceTracking.date, sql`NOW() - INTERVAL '7 days'`)
+      ))
+      .where(and(
+        eq(patients.primaryDoctorId, doctorId),
+        eq(patients.isActive, true)
+      ))
+      .groupBy(patients.id, patients.firstName, patients.lastName, users.email)
+      .orderBy(sql`currentCompliance ASC`);
+
+    return result;
+  }
+
+  async getComplianceAlerts(patientId: string): Promise<any[]> {
+    const alerts = [];
+
+    // Get overdue medicines
+    const overdueMedicines = await db
+      .select({
+        id: medicineSchedule.id,
+        medicineName: medicines.name,
+        scheduledAt: medicineSchedule.scheduledAt,
+        dosage: medicines.dosage,
+        type: sql<string>`'overdue'`,
+        severity: sql<string>`CASE 
+          WHEN ${medicineSchedule.scheduledAt} <= NOW() - INTERVAL '1 day' THEN 'high'
+          WHEN ${medicineSchedule.scheduledAt} <= NOW() - INTERVAL '2 hours' THEN 'medium'
+          ELSE 'low'
+        END`,
+      })
+      .from(medicineSchedule)
+      .leftJoin(medicines, eq(medicineSchedule.medicineId, medicines.id))
+      .where(and(
+        eq(medicineSchedule.patientId, patientId),
+        eq(medicineSchedule.status, "pending"),
+        lte(medicineSchedule.scheduledAt, new Date())
+      ))
+      .orderBy(medicineSchedule.scheduledAt);
+
+    alerts.push(...overdueMedicines);
+
+    // Check for low compliance (last 7 days < 70%)
+    const complianceRate = await this.getComplianceRate(patientId, 7);
+    if (complianceRate < 70) {
+      alerts.push({
+        type: "low_compliance",
+        severity: complianceRate < 50 ? "high" : "medium",
+        message: `Compliance rate is ${complianceRate}% over the last 7 days`,
+        complianceRate,
+      });
+    }
+
+    return alerts;
+  }
+
+  async getDoctorComplianceAlerts(doctorId: string): Promise<any[]> {
+    const result = await db
+      .select({
+        patientId: patients.id,
+        patientName: sql<string>`${patients.firstName} || ' ' || ${patients.lastName}`,
+        alertType: sql<string>`'low_compliance'`,
+        severity: sql<string>`CASE 
+          WHEN AVG(CAST(${complianceTracking.compliancePercentage} AS numeric)) < 50 THEN 'high'
+          WHEN AVG(CAST(${complianceTracking.compliancePercentage} AS numeric)) < 70 THEN 'medium'
+          ELSE 'low'
+        END`,
+        complianceRate: sql<number>`AVG(CAST(${complianceTracking.compliancePercentage} AS numeric))`,
+        overdueMedicines: sql<number>`COUNT(CASE WHEN ${medicineSchedule.status} = 'pending' AND ${medicineSchedule.scheduledAt} <= NOW() THEN 1 END)`,
+      })
+      .from(patients)
+      .leftJoin(complianceTracking, and(
+        eq(complianceTracking.patientId, patients.id),
+        gte(complianceTracking.date, sql`NOW() - INTERVAL '7 days'`)
+      ))
+      .leftJoin(prescriptions, eq(prescriptions.patientId, patients.id))
+      .leftJoin(medicines, eq(medicines.prescriptionId, prescriptions.id))
+      .leftJoin(medicineSchedule, eq(medicineSchedule.medicineId, medicines.id))
+      .where(and(
+        eq(patients.primaryDoctorId, doctorId),
+        eq(patients.isActive, true)
+      ))
+      .groupBy(patients.id, patients.firstName, patients.lastName)
+      .having(sql`AVG(CAST(${complianceTracking.compliancePercentage} AS numeric)) < 70 OR COUNT(CASE WHEN ${medicineSchedule.status} = 'pending' AND ${medicineSchedule.scheduledAt} <= NOW() THEN 1 END) > 0`)
+      .orderBy(sql`complianceRate ASC`);
+
+    return result;
   }
 }
 

@@ -215,6 +215,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const updatedSchedule = await storage.markMedicineAsTaken(scheduleId);
+      
+      // Update daily compliance after marking medicine status
+      const medicine = await storage.getMedicine(schedule.medicineId);
+      if (medicine) {
+        await storage.updateDailyCompliance(patient.id, medicine.prescriptionId, new Date());
+      }
+      
       res.json(updatedSchedule);
     } catch (error) {
       console.error("Error marking medicine as taken:", error);
@@ -239,10 +246,157 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const updatedSchedule = await storage.markMedicineAsMissed(scheduleId);
+      
+      // Update daily compliance after marking medicine status
+      const medicine = await storage.getMedicine(schedule.medicineId);
+      if (medicine) {
+        await storage.updateDailyCompliance(patient.id, medicine.prescriptionId, new Date());
+      }
+      
       res.json(updatedSchedule);
     } catch (error) {
       console.error("Error marking medicine as missed:", error);
       res.status(500).json({ message: "Failed to mark medicine as missed" });
+    }
+  });
+
+  // Enhanced Compliance Tracking APIs
+
+  // Get detailed compliance statistics for a patient
+  app.get("/api/patient/compliance", isAuthenticated, requireRole("patient"), requireOwnPatientData, async (req: any, res) => {
+    try {
+      const patient = req.currentPatient;
+      
+      // Parse and validate query parameters
+      let days = parseInt(req.query.days as string) || 7;
+      let weeks = parseInt(req.query.weeks as string) || 4;
+      
+      // Clamp to sane ranges
+      days = Math.max(1, Math.min(days, 365));
+      weeks = Math.max(1, Math.min(weeks, 52));
+
+      const weeklyCompliance = await storage.getWeeklyComplianceStats(patient.id, weeks);
+      const dailyCompliance = await storage.getDailyComplianceStats(patient.id, days);
+      const medicineCompliance = await storage.getMedicineComplianceBreakdown(patient.id);
+      const currentStreak = await storage.getComplianceStreak(patient.id);
+      
+      res.json({
+        overview: {
+          currentRate: await storage.getComplianceRate(patient.id, days),
+          streak: currentStreak,
+          totalMedicines: medicineCompliance.length,
+        },
+        trends: {
+          weekly: weeklyCompliance,
+          daily: dailyCompliance,
+        },
+        breakdown: medicineCompliance,
+      });
+    } catch (error) {
+      console.error("Error fetching compliance stats:", error);
+      res.status(500).json({ message: "Failed to fetch compliance statistics" });
+    }
+  });
+
+  // Get compliance for doctor's patients
+  app.get("/api/doctor/patients/compliance", isAuthenticated, requireRole("doctor"), async (req: any, res) => {
+    try {
+      const doctor = await storage.getDoctorByUserId(req.user.claims.sub);
+      if (!doctor) {
+        return res.status(404).json({ message: "Doctor profile not found" });
+      }
+
+      const patientsCompliance = await storage.getPatientComplianceOverview(doctor.id);
+      res.json(patientsCompliance);
+    } catch (error) {
+      console.error("Error fetching patients compliance:", error);
+      res.status(500).json({ message: "Failed to fetch patients compliance" });
+    }
+  });
+
+  // Get compliance alerts (overdue medicines, low compliance)
+  app.get("/api/compliance/alerts", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUserWithRole(userId);
+      
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      let alerts = [];
+
+      if (user.role === "patient") {
+        const patient = await storage.getPatientByUserId(userId);
+        if (patient) {
+          alerts = await storage.getComplianceAlerts(patient.id);
+        }
+      } else if (user.role === "doctor") {
+        const doctor = await storage.getDoctorByUserId(userId);
+        if (doctor) {
+          alerts = await storage.getDoctorComplianceAlerts(doctor.id);
+        }
+      }
+
+      res.json(alerts);
+    } catch (error) {
+      console.error("Error fetching compliance alerts:", error);
+      res.status(500).json({ message: "Failed to fetch compliance alerts" });
+    }
+  });
+
+  // Update compliance after medicine action (with real-time tracking)
+  app.post("/api/compliance/update", isAuthenticated, requireRole("patient"), async (req: any, res) => {
+    try {
+      const patient = await storage.getPatientByUserId(req.user.claims.sub);
+      if (!patient) {
+        return res.status(404).json({ message: "Patient profile not found" });
+      }
+
+      const { scheduleId, action } = req.body; // action: 'taken', 'missed', 'skipped'
+      
+      const schedule = await storage.getMedicineSchedule(scheduleId);
+      if (!schedule || schedule.patientId !== patient.id) {
+        return res.status(404).json({ message: "Medicine schedule not found" });
+      }
+
+      let updatedSchedule;
+      switch (action) {
+        case 'taken':
+          updatedSchedule = await storage.markMedicineAsTaken(scheduleId);
+          break;
+        case 'missed':
+          updatedSchedule = await storage.markMedicineAsMissed(scheduleId);
+          break;
+        case 'skipped':
+          updatedSchedule = await storage.markMedicineAsSkipped(scheduleId, req.body.reason);
+          break;
+        default:
+          return res.status(400).json({ message: "Invalid action" });
+      }
+
+      // Real-time compliance update
+      const medicine = await storage.getMedicine(schedule.medicineId);
+      if (medicine) {
+        await storage.updateDailyCompliance(patient.id, medicine.prescriptionId, new Date());
+      }
+
+      // Get updated compliance stats
+      const complianceRate = await storage.getComplianceRate(patient.id);
+      const todaysSchedule = await storage.getTodaysMedicineSchedule(patient.id);
+      const overdueMedicines = await storage.getOverdueMedicines(patient.id);
+
+      res.json({
+        schedule: updatedSchedule,
+        compliance: {
+          rate: complianceRate,
+          todaysSchedule,
+          overdueMedicines,
+        },
+      });
+    } catch (error) {
+      console.error("Error updating compliance:", error);
+      res.status(500).json({ message: "Failed to update compliance" });
     }
   });
 
